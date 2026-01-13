@@ -1,15 +1,34 @@
+import json
+import os
 import random
 import torch
 import numpy as np
-
 import math
 import networkx as nx
-import dwave_networkx as dnx
+import scipy.io as sio
 from collections import defaultdict
 
-device="cpu"
+# ---- optional line_profiler ----
+try:
+    from line_profiler import profile  # type: ignore
+except Exception:
+    def profile(fn):
+        return fn
+
+# ---- device ----
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 class lsing_model(torch.nn.Module):
-    def __init__(self, input_node_num=28*28, label_class_num=10, label_node_num=50, all_node_num=4264):
+    def __init__(
+        self,
+        input_node_num=28*28,
+        label_class_num=10,
+        label_node_num=50,
+        all_node_num=4264,
+        group_init="load",
+        group_dir="Data",
+    ):
         super().__init__()
 
         self.input_node_num = input_node_num
@@ -18,94 +37,180 @@ class lsing_model(torch.nn.Module):
         self.all_node_num = all_node_num
 
         self.create_pegasus_pegasus()
-        self.group()
+        self.group(init_method=group_init, base_dir=group_dir)
         self.create_J_H()
 
     def create_pegasus_pegasus(self):
-        ori_G = dnx.pegasus_graph(15, node_list=np.arange(self.all_node_num))
+        mat = sio.loadmat("Data/JJ_4264.mat")
+        W = mat["W"]
 
-        # 随机打乱节点顺序
-        nodes = list(ori_G.nodes)
-        random.shuffle(nodes)
-
-        # 映射节点为从0开始的序列，并修改相应的边
-        nodes_map = {node : idx for idx, node in enumerate(nodes)}
-        nodes = nodes_map.keys()
-        edges = [(nodes_map[x], nodes_map[y]) for x, y in ori_G.edges]
-
-        # 构建graph
         self.graph = nx.Graph()
-        self.graph.add_nodes_from(nodes)
-        self.graph.add_edges_from(edges)
+        self.graph.add_nodes_from(range(W.shape[0]))
 
-    def group(self):
-        color_map = nx.greedy_color(self.graph, strategy='DSATUR')
-        self.group_all = defaultdict(list)
+        if hasattr(W, "tocoo"):
+            coo = W.tocoo()
+            rows = coo.row
+            cols = coo.col
+        else:
+            rows, cols = np.nonzero(W)
+
+        mask = rows != cols
+        edges = zip(rows[mask].tolist(), cols[mask].tolist())
+        self.graph.add_edges_from(edges)
+        print("create_pegasus_pegasus")
+
+    def group(self, init_method="load", base_dir="Data"):
+        colors = np.loadtxt(os.path.join(base_dir, "colorMap_4264.csv"), delimiter=",", dtype=int)
+        if colors.ndim != 1:
+            colors = colors.reshape(-1)
+        node_count = self.graph.number_of_nodes()
+        if colors.shape[0] < node_count:
+            raise ValueError(
+                f"color map length {colors.shape[0]} < node count {node_count}"
+            )
+        if self.input_node_num + self.label_node_num > node_count:
+            raise ValueError("input_node_num + label_node_num exceeds node count")
+
+        self.color_map = {i: int(colors[i]) for i in range(node_count)}
+        if init_method == "load":
+            self.load_saved_groups(base_dir=base_dir)
+        elif init_method == "random":
+            self._init_groups_random(node_count, base_dir)
+        else:
+            raise ValueError(f"unknown init_method: {init_method}")
+
+        self._build_group_all()
+        print("grouped")
+
+    def _init_groups_random(self, node_count, base_dir):
+        all_nodes = list(range(node_count))
+        visible_nodes = set(random.sample(all_nodes, self.input_node_num))
+        remaining_nodes = [n for n in all_nodes if n not in visible_nodes]
+        label_nodes = set(random.sample(remaining_nodes, self.label_node_num))
+
+        color_map = self.color_map
         self.group_hidden = defaultdict(list)
         self.group_clssify = defaultdict(list)
         self.group_gen = defaultdict(list)
+        self.group_visible = defaultdict(list)
+        self.group_label = defaultdict(list)
+
         for node, color in color_map.items():
-            if True:
-                self.group_all[color].append(node)
-            if node >= self.input_node_num + self.label_node_num:
-                self.group_hidden[color].append(node)
-            if node >= self.input_node_num:
+            if node in visible_nodes:
+                self.group_visible[color].append(node)
+
+            if node in label_nodes:
+                self.group_label[color].append(node)
+
+            if node not in visible_nodes:
                 self.group_clssify[color].append(node)
-            if node < self.input_node_num or node >= self.input_node_num + self.label_node_num:
+
+            if node not in visible_nodes and node not in label_nodes:
+                self.group_hidden[color].append(node)
+
+            # generation: update image bits + hidden bits, but DO NOT update label bits
+            if node not in label_nodes:
                 self.group_gen[color].append(node)
+
+        for d in [
+            self.group_hidden,
+            self.group_clssify,
+            self.group_gen,
+            self.group_visible,
+            self.group_label,
+        ]:
+            for key, value in d.items():
+                value.sort()
+                d[key] = torch.LongTensor(value).to(device)
+        self._save_group_dict_json(self.group_hidden, os.path.join(base_dir, "group_hidden.json"))
+        self._save_group_dict_json(self.group_clssify, os.path.join(base_dir, "group_clssify.json"))
+        self._save_group_dict_json(self.group_gen, os.path.join(base_dir, "group_gen.json"))
+        self._save_group_dict_json(self.group_visible, os.path.join(base_dir, "group_visible.json"))
+        self._save_group_dict_json(self.group_label, os.path.join(base_dir, "group_label.json"))
+
+    def _build_group_all(self):
+        self.group_all = defaultdict(list)
+        for node, color in self.color_map.items():
+            self.group_all[color].append(node)
         for key, value in self.group_all.items():
             value.sort()
             self.group_all[key] = torch.LongTensor(value).to(device)
-        for key, value in self.group_hidden.items():
-            value.sort()
-            self.group_hidden[key] = torch.LongTensor(value).to(device)
-        for key, value in self.group_clssify.items():
-            value.sort()
-            self.group_clssify[key] = torch.LongTensor(value).to(device)
-        for key, value in self.group_gen.items():
-            value.sort()
-            self.group_gen[key] = torch.LongTensor(value).to(device)
+
+
 
     def create_J_H(self):
-        self.J = torch.zeros((self.all_node_num, self.all_node_num)).to(device)
+        self.J = torch.zeros((self.all_node_num, self.all_node_num), device=device)
         for x, y in self.graph.edges:
             x = int(x)
             y = int(y)
-            self.J[x, y] = self.J[y, x] = torch.randn(1) * 0.01
-        self.J_mask = torch.where(self.J!=0, 1., 0.).to(device)
+            self.J[x, y] = self.J[y, x] = torch.randn(1, device=device) * 0.01
 
-        self.H = torch.zeros(self.all_node_num).to(device)
+        self.J_mask = torch.where(self.J != 0, 1.0, 0.0).to(device)
+
+        self.H = torch.zeros(self.all_node_num, device=device)
         visible_num = self.input_node_num + self.label_node_num
-        self.H[:visible_num] = math.log( (visible_num/self.all_node_num) / (1 - visible_num/self.all_node_num))
+        # 这里还是你的初始化方式（训练时你若已改成基于数据pi，也可以保持你自己的）
+        self.H[:visible_num] = math.log((visible_num / self.all_node_num) / (1 - visible_num / self.all_node_num))
 
         self.deta_J_all = 0
         self.deta_H_all = 0
 
-    def create_m(self, images_batch=None, labels_batch=None):
-        m = torch.randint(0, 2, (images_batch.shape[0], self.all_node_num)).to(device)
-        if images_batch != None:
+    def create_m(self, images_batch=None, labels_batch=None, batch_size=None):
+        """
+        支持三种用法：
+        1) create_m(images_batch, labels_batch)  -> 训练/正相位
+        2) create_m(images_batch)               -> 推理/分类
+        3) create_m(batch_size=K)               -> 生成：从随机状态开始（无图像输入）
+        """
+        if images_batch is not None:
+            bs = images_batch.shape[0]
+        elif labels_batch is not None:
+            bs = labels_batch.shape[0]
+        elif batch_size is not None:
+            bs = int(batch_size)
+        else:
+            raise ValueError("create_m requires images_batch or labels_batch or batch_size")
+
+        m = torch.randint(0, 2, (bs, self.all_node_num), device=device)
+
+        # clamp image bits if provided (binary 0/1 expected)
+        if images_batch is not None:
             m[:, :self.input_node_num] = images_batch
 
-        if labels_batch != None:
-            labels = torch.zeros((labels_batch.shape[0], self.label_node_num))
+        # clamp label bits if provided
+        if labels_batch is not None:
+            labels = torch.zeros((bs, self.label_node_num), device=device)
             for i, label in enumerate(labels_batch):
+                # repeat one-hot across label sets: e.g. 0,10,20,30,40 are all "digit 0"
                 labels[i][int(label)::self.label_class_num] = 1
-            m[:, self.input_node_num : self.input_node_num + self.label_node_num] = labels
+            m[:, self.input_node_num:self.input_node_num + self.label_node_num] = labels
 
-        m = torch.where(m==0, -1., 1.)
-
+        # to bipolar {-1,+1}
+        m = torch.where(m == 0, -1.0, 1.0)
         return m
 
-    from line_profiler import profile
     @profile
-    def construct(self, m, group, sample_num=1e+3):
+    def construct(self, m, group, sample_num=1e3, beta=1.0):
+        """
+        Gibbs updates over a colored node-group.
+        增加 beta：用 tanh(beta * I) 做退火。
+        """
+        # cache sparse rows for each color block (lightweight)
         J_group = [self.J[idxs].to_sparse_coo() for idxs in group.values()]
         H_group = [self.H[idxs] for idxs in group.values()]
+
+        beta = float(beta)
 
         for _ in range(int(sample_num)):
             for idxs, J, H in zip(group.values(), J_group, H_group):
                 I = torch.sparse.mm(J, m.T).T + H
-                m[:, idxs] = torch.sgn(torch.tanh(I) - (torch.rand_like(I)*2-1))
+                # annealed update:
+                # m_i = sgn( tanh(beta*I_i) - u ), u~U[-1,1]
+                u = torch.rand_like(I) * 2 - 1
+                new_state = torch.sign(torch.tanh(I * beta) - u)
+                # torch.sign can output 0 if exactly equal; map 0 -> +1 to keep bipolar
+                new_state = torch.where(new_state == 0, torch.ones_like(new_state), new_state)
+                m[:, idxs] = new_state
 
         return m
 
@@ -118,3 +223,61 @@ class lsing_model(torch.nn.Module):
 
         self.J = torch.add(self.J, self.deta_J_all * self.J_mask)
         self.H = torch.add(self.H, self.deta_H_all)
+
+
+    def save_graph_image(self, path="graph.png", layout="sfdp", max_nodes=None):
+        """
+        Save a graph visualization using Graphviz layout.
+        layout: dot, neato, fdp, sfdp, twopi, circo
+        max_nodes: optional cap for a clearer subgraph
+        """
+        import matplotlib.pyplot as plt
+
+        try:
+            from networkx.drawing.nx_agraph import graphviz_layout
+        except Exception:
+            try:
+                from networkx.drawing.nx_pydot import graphviz_layout
+            except Exception as exc:
+                raise RuntimeError(
+                    "Graphviz layout needs pygraphviz or pydot plus Graphviz installed."
+                ) from exc
+
+        g = self.graph
+        if max_nodes is not None:
+            n = min(int(max_nodes), g.number_of_nodes())
+            nodes = random.sample(list(g.nodes()), k=n)
+            g = g.subgraph(nodes)
+
+        node_color = None
+        if hasattr(self, "color_map"):
+            palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+            unique = sorted({self.color_map[n] for n in g.nodes()})
+            color_lookup = {c: palette[i % len(palette)] for i, c in enumerate(unique)}
+            node_color = [color_lookup[self.color_map[n]] for n in g.nodes()]
+
+        pos = graphviz_layout(g, prog=layout)
+        plt.figure(figsize=(10, 10))
+        nx.draw(g, pos=pos, node_size=6, width=0.2, alpha=0.7, node_color=node_color)
+        plt.axis("off")
+        plt.tight_layout()
+        plt.savefig(path, dpi=300)
+        plt.close()
+
+    def _save_group_dict_json(self, group, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = {str(k): v.detach().cpu().tolist() for k, v in group.items()}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=True, indent=2, sort_keys=True)
+
+    def _load_group_dict_json(self, path):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {int(k): torch.LongTensor(v).to(device) for k, v in data.items()}
+
+    def load_saved_groups(self, base_dir="Data"):
+        self.group_hidden = self._load_group_dict_json(os.path.join(base_dir, "group_hidden.json"))
+        self.group_clssify = self._load_group_dict_json(os.path.join(base_dir, "group_clssify.json"))
+        self.group_gen = self._load_group_dict_json(os.path.join(base_dir, "group_gen.json"))
+        self.group_visible = self._load_group_dict_json(os.path.join(base_dir, "group_visible.json"))
+        self.group_label = self._load_group_dict_json(os.path.join(base_dir, "group_label.json"))

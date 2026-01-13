@@ -1,6 +1,6 @@
 import torch
 from download import download
-device="cpu"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 
@@ -36,7 +36,7 @@ def main():
     test_acc = []
     with torch.no_grad():
         for epoch in range(50):
-            acc = torch.tensor([]).cuda()
+            acc = torch.tensor([]).to(device)
             bar = tqdm(train_dataset_loader)
             for images_batch, labels_batch in bar:
                 m = model.create_m(images_batch, labels_batch)
@@ -60,7 +60,7 @@ def main():
                 m = model.create_m(images_batch)
                 m = model.construct(m, model.group_clssify)
 
-                acc = torch.tensor([]).cuda()
+                acc = torch.tensor([]).to(device)
                 logits = m[:, input_node_num:input_node_num+label_node_num].reshape(-1, label_node_num//label_class_num, label_class_num)
                 logits = logits.sum(dim=-2).argmax(dim=-1)
                 logits = torch.where(logits==labels_batch, 1., 0.)
@@ -70,5 +70,5 @@ def main():
             test_acc.append(acc.mean().item())
             torch.save(model, "model.pth")
             np.savetxt("test_acc.txt", test_acc)
-
-main()
+if __name__ == "__main__":
+    main()

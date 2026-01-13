@@ -1,6 +1,6 @@
 import torch
 from download import download
-device="cpu"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 import matplotlib.pyplot as plt
 import numpy as np
