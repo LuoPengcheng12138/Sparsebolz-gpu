@@ -2,19 +2,22 @@ import torch
 from download import download
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
+train_size = 1000
+test_size = 100
 
 from read_MNIST import decode_idx3_ubyte as read_images
 from read_MNIST import decode_idx1_ubyte as read_labels
 images = torch.tensor(read_images("./MNIST_Data/train/train-images-idx3-ubyte")).reshape(60000, 28*28).to(device)
 labels = torch.tensor(read_labels("./MNIST_Data/train/train-labels-idx1-ubyte")).to(device)
-
+images = images[:train_size]
+labels = labels[:train_size]
 train_dataset = torch.utils.data.TensorDataset(images, labels)
 train_dataset_loader = torch.utils.data.DataLoader(train_dataset, batch_size=50, shuffle=True, pin_memory=False)
 
 images = torch.tensor(read_images("./MNIST_Data/test/t10k-images-idx3-ubyte")).reshape(10000, 28*28).to(device)
 labels = torch.tensor(read_labels("./MNIST_Data/test/t10k-labels-idx1-ubyte")).to(device)
-
+images = images[:test_size]
+labels = labels[:test_size]
 test_dataset = torch.utils.data.TensorDataset(images, labels)
 test_dataset_loader = torch.utils.data.DataLoader(test_dataset, batch_size=50, shuffle=True, pin_memory=False)
 
