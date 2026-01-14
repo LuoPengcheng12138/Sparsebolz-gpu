@@ -35,6 +35,7 @@ class lsing_model(torch.nn.Module):
         self.label_class_num = label_class_num
         self.label_node_num = label_node_num
         self.all_node_num = all_node_num
+        self.input_nodes = None
 
         self.create_pegasus_pegasus()
         self.group(init_method=group_init, base_dir=group_dir)
@@ -92,13 +93,9 @@ class lsing_model(torch.nn.Module):
         self.group_hidden = defaultdict(list)
         self.group_clssify = defaultdict(list)
         self.group_gen = defaultdict(list)
-        self.group_visible = defaultdict(list)
         self.group_label = defaultdict(list)
 
         for node, color in color_map.items():
-            if node in visible_nodes:
-                self.group_visible[color].append(node)
-
             if node in label_nodes:
                 self.group_label[color].append(node)
 
@@ -112,11 +109,13 @@ class lsing_model(torch.nn.Module):
             if node not in label_nodes:
                 self.group_gen[color].append(node)
 
+        self.input_nodes = torch.LongTensor(sorted(visible_nodes)).to(device)
+        self._build_label_class_nodes(label_nodes)
+
         for d in [
             self.group_hidden,
             self.group_clssify,
             self.group_gen,
-            self.group_visible,
             self.group_label,
         ]:
             for key, value in d.items():
@@ -125,8 +124,9 @@ class lsing_model(torch.nn.Module):
         self._save_group_dict_json(self.group_hidden, os.path.join(base_dir, "group_hidden.json"))
         self._save_group_dict_json(self.group_clssify, os.path.join(base_dir, "group_clssify.json"))
         self._save_group_dict_json(self.group_gen, os.path.join(base_dir, "group_gen.json"))
-        self._save_group_dict_json(self.group_visible, os.path.join(base_dir, "group_visible.json"))
+        self._save_nodes_json(self.input_nodes, os.path.join(base_dir, "group_visible.json"))
         self._save_group_dict_json(self.group_label, os.path.join(base_dir, "group_label.json"))
+        self._save_group_dict_json(self.label_class_nodes, os.path.join(base_dir, "label_class_nodes.json"))
 
     def _build_group_all(self):
         self.group_all = defaultdict(list)
@@ -136,7 +136,45 @@ class lsing_model(torch.nn.Module):
             value.sort()
             self.group_all[key] = torch.LongTensor(value).to(device)
 
+    def _build_label_class_nodes(self, label_nodes):
+        if self.label_node_num % self.label_class_num != 0:
+            raise ValueError("label_node_num must be divisible by label_class_num")
 
+        label_nodes = list(label_nodes)
+        if len(label_nodes) != self.label_node_num:
+            raise ValueError("label_nodes size does not match label_node_num")
+
+        random.shuffle(label_nodes)
+        per_class = self.label_node_num // self.label_class_num
+        self.label_class_nodes = {}
+        for c in range(self.label_class_num):
+            chunk = sorted(label_nodes[c * per_class:(c + 1) * per_class])
+            self.label_class_nodes[c] = torch.LongTensor(chunk).to(device)
+
+        self.label_nodes = torch.LongTensor(sorted(label_nodes)).to(device)
+
+    def _build_label_nodes_from_class_nodes(self):
+        if not self.label_class_nodes:
+            self.label_nodes = None
+            return
+        ordered = [self.label_class_nodes[k] for k in sorted(self.label_class_nodes.keys())]
+        nodes = torch.cat(ordered)
+        nodes = torch.unique(nodes)
+        nodes, _ = torch.sort(nodes)
+        self.label_nodes = nodes
+
+    def _get_visible_nodes(self):
+        nodes = []
+        if getattr(self, "input_nodes", None) is not None:
+            nodes.append(self.input_nodes)
+        if getattr(self, "label_nodes", None) is not None:
+            nodes.append(self.label_nodes)
+        if not nodes:
+            return None
+        merged = torch.cat(nodes)
+        merged = torch.unique(merged)
+        merged, _ = torch.sort(merged)
+        return merged
 
     def create_J_H(self):
         self.J = torch.zeros((self.all_node_num, self.all_node_num), device=device)
@@ -148,9 +186,15 @@ class lsing_model(torch.nn.Module):
         self.J_mask = torch.where(self.J != 0, 1.0, 0.0).to(device)
 
         self.H = torch.zeros(self.all_node_num, device=device)
-        visible_num = self.input_node_num + self.label_node_num
+        visible_nodes = self._get_visible_nodes()
+        if visible_nodes is None:
+            visible_num = self.input_node_num + self.label_node_num
+            visible_nodes = torch.arange(visible_num, device=device)
+        else:
+            visible_num = int(visible_nodes.numel())
         # 这里还是你的初始化方式（训练时你若已改成基于数据pi，也可以保持你自己的）
-        self.H[:visible_num] = math.log((visible_num / self.all_node_num) / (1 - visible_num / self.all_node_num))
+        bias = math.log((visible_num / self.all_node_num) / (1 - visible_num / self.all_node_num))
+        self.H[visible_nodes] = bias
 
         self.deta_J_all = 0
         self.deta_H_all = 0
@@ -171,19 +215,32 @@ class lsing_model(torch.nn.Module):
         else:
             raise ValueError("create_m requires images_batch or labels_batch or batch_size")
 
-        m = torch.randint(0, 2, (bs, self.all_node_num), device=device)
+        m = torch.randint(0, 2, (bs, self.all_node_num), device=device, dtype=torch.float32)
 
         # clamp image bits if provided (binary 0/1 expected)
         if images_batch is not None:
-            m[:, :self.input_node_num] = images_batch
+            input_nodes = getattr(self, "input_nodes", None)
+            if input_nodes is None:
+                input_nodes = torch.arange(self.input_node_num, device=device)
+            if images_batch.shape[1] != input_nodes.shape[0]:
+                raise ValueError("images_batch size does not match input_nodes size")
+            m[:, input_nodes] = images_batch.to(m.dtype)
 
         # clamp label bits if provided
         if labels_batch is not None:
-            labels = torch.zeros((bs, self.label_node_num), device=device)
-            for i, label in enumerate(labels_batch):
-                # repeat one-hot across label sets: e.g. 0,10,20,30,40 are all "digit 0"
-                labels[i][int(label)::self.label_class_num] = 1
-            m[:, self.input_node_num:self.input_node_num + self.label_node_num] = labels
+            if getattr(self, "label_class_nodes", None):
+                if getattr(self, "label_nodes", None) is None:
+                    self._build_label_nodes_from_class_nodes()
+                m[:, self.label_nodes] = 0
+                for i, label in enumerate(labels_batch):
+                    class_nodes = self.label_class_nodes[int(label)]
+                    m[i, class_nodes] = 1
+            else:
+                labels = torch.zeros((bs, self.label_node_num), device=device)
+                for i, label in enumerate(labels_batch):
+                    # repeat one-hot across label sets: e.g. 0,10,20,30,40 are all "digit 0"
+                    labels[i][int(label)::self.label_class_num] = 1
+                m[:, self.input_node_num:self.input_node_num + self.label_node_num] = labels
 
         # to bipolar {-1,+1}
         m = torch.where(m == 0, -1.0, 1.0)
@@ -270,14 +327,47 @@ class lsing_model(torch.nn.Module):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=True, indent=2, sort_keys=True)
 
+    def _save_nodes_json(self, nodes, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = [int(n) for n in nodes]
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=True, indent=2, sort_keys=False)
+
     def _load_group_dict_json(self, path):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return {int(k): torch.LongTensor(v).to(device) for k, v in data.items()}
 
+    def _load_nodes_json(self, path):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            nodes = []
+            for value in data.values():
+                nodes.extend(value)
+        elif isinstance(data, list):
+            nodes = data
+        else:
+            raise ValueError("invalid nodes json format")
+        nodes = sorted({int(n) for n in nodes})
+        return torch.LongTensor(nodes).to(device)
+
     def load_saved_groups(self, base_dir="Data"):
         self.group_hidden = self._load_group_dict_json(os.path.join(base_dir, "group_hidden.json"))
         self.group_clssify = self._load_group_dict_json(os.path.join(base_dir, "group_clssify.json"))
         self.group_gen = self._load_group_dict_json(os.path.join(base_dir, "group_gen.json"))
-        self.group_visible = self._load_group_dict_json(os.path.join(base_dir, "group_visible.json"))
         self.group_label = self._load_group_dict_json(os.path.join(base_dir, "group_label.json"))
+        group_visible_path = os.path.join(base_dir, "group_visible.json")
+        if os.path.exists(group_visible_path):
+            self.input_nodes = self._load_nodes_json(group_visible_path)
+            if int(self.input_nodes.numel()) != self.input_node_num:
+                raise ValueError("input_nodes size does not match input_node_num")
+        else:
+            self.input_nodes = torch.arange(self.input_node_num, device=device)
+        label_class_path = os.path.join(base_dir, "label_class_nodes.json")
+        if os.path.exists(label_class_path):
+            self.label_class_nodes = self._load_group_dict_json(label_class_path)
+            self._build_label_nodes_from_class_nodes()
+        else:
+            self.label_class_nodes = None
+            self.label_nodes = None

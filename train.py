@@ -32,13 +32,26 @@ label_node_num=50
 all_node_num=4264
 
 from line_profiler import profile
+
+def predict_labels(m, model):
+    if getattr(model, "label_class_nodes", None):
+        class_keys = sorted(model.label_class_nodes.keys())
+        class_nodes = [model.label_class_nodes[k] for k in class_keys]
+        scores = torch.stack([m[:, idxs].sum(dim=1) for idxs in class_nodes], dim=1)
+        return scores.argmax(dim=1)
+
+    logits = m[:, input_node_num:input_node_num+label_node_num].reshape(
+        -1, label_node_num//label_class_num, label_class_num
+    )
+    return logits.sum(dim=-2).argmax(dim=-1)
+
 @profile
 def main():
-    model = lsing_model(label_class_num=10).to(device)
+    model = lsing_model(label_class_num=label_class_num, label_node_num=label_node_num).to(device)
 
     test_acc = []
     with torch.no_grad():
-        for epoch in range(50):
+        for epoch in range(5):
             acc = torch.tensor([]).to(device)
             bar = tqdm(train_dataset_loader)
             for images_batch, labels_batch in bar:
@@ -50,23 +63,21 @@ def main():
 
                 model.updateParams(m_data, m_model, batch_size=images_batch.shape[0])
 
-                logits = m[:, input_node_num:input_node_num+label_node_num].reshape(-1, label_node_num//label_class_num, label_class_num)
-                logits = logits.sum(dim=-2).argmax(dim=-1)
-                logits = torch.where(logits==labels_batch, 1., 0.)
+                preds = predict_labels(m, model)
+                logits = torch.where(preds==labels_batch, 1., 0.)
                 acc = torch.cat([acc, logits])
 
                 bar.set_postfix({
                     "acc" : acc.mean().item()
                 })
 
+            acc = torch.tensor([]).to(device)
             for images_batch, labels_batch in test_dataset_loader:
                 m = model.create_m(images_batch)
                 m = model.construct(m, model.group_clssify)
 
-                acc = torch.tensor([]).to(device)
-                logits = m[:, input_node_num:input_node_num+label_node_num].reshape(-1, label_node_num//label_class_num, label_class_num)
-                logits = logits.sum(dim=-2).argmax(dim=-1)
-                logits = torch.where(logits==labels_batch, 1., 0.)
+                preds = predict_labels(m, model)
+                logits = torch.where(preds==labels_batch, 1., 0.)
                 acc = torch.cat([acc, logits])
 
             print(f"epoch {epoch} test result acc:{acc.mean().item()}")
