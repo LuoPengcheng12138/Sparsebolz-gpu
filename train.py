@@ -31,6 +31,15 @@ label_class_num=10
 label_node_num=50
 all_node_num=4264
 
+USE_NMFA = True
+NMFA_STEPS = 40          # 先用 20~80 试
+NMFA_T_START = 5.0
+NMFA_T_END = 0.8
+NMFA_SIGMA = 0.2
+NMFA_ALPHA = 0.9
+GIBBS_MODEL_SWEEPS = 150  # 原来你 construct 默认 1e3，很慢；有 NMFA 预热后可大幅降
+GIBBS_DATA_SWEEPS = 300   # 正相（hidden）可以先不动或略降，看效果
+
 from line_profiler import profile
 
 def predict_labels(m, model):
@@ -56,10 +65,22 @@ def main():
             bar = tqdm(train_dataset_loader)
             for images_batch, labels_batch in bar:
                 m = model.create_m(images_batch, labels_batch)
-                m_data = model.construct(m, model.group_hidden)
+                m_data = model.construct(m, model.group_hidden, sample_num=GIBBS_DATA_SWEEPS)
 
                 m = model.create_m(images_batch, labels_batch)
-                m_model = model.construct(m, model.group_all)
+
+                if USE_NMFA:
+                    # NMFA 作为 warm-start（此处不 clamp，让它自由跑到低能态附近）
+                    m = model.nmfa_warm_start(
+                        m,
+                        steps=NMFA_STEPS,
+                        T_start=NMFA_T_START,
+                        T_end=NMFA_T_END,
+                        sigma=NMFA_SIGMA,
+                        alpha=NMFA_ALPHA,
+                        clamp_nodes=None,
+                    )
+                m_model = model.construct(m, model.group_all, sample_num=GIBBS_MODEL_SWEEPS)
 
                 model.updateParams(m_data, m_model, batch_size=images_batch.shape[0])
 

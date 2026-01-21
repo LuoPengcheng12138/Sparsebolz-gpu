@@ -7,7 +7,7 @@ import math
 import networkx as nx
 import scipy.io as sio
 from collections import defaultdict
-
+from typing import Optional
 # ---- optional line_profiler ----
 try:
     from line_profiler import profile  # type: ignore
@@ -221,7 +221,7 @@ class lsing_model(torch.nn.Module):
         if images_batch is not None:
             input_nodes = getattr(self, "input_nodes", None)
             if input_nodes is None:
-                input_nodes = torch.arange(self.input_node_num, device=device)
+                raise ValueError("input_nodes is None")
             if images_batch.shape[1] != input_nodes.shape[0]:
                 raise ValueError("images_batch size does not match input_nodes size")
             m[:, input_nodes] = images_batch.to(m.dtype)
@@ -230,17 +230,13 @@ class lsing_model(torch.nn.Module):
         if labels_batch is not None:
             if getattr(self, "label_class_nodes", None):
                 if getattr(self, "label_nodes", None) is None:
-                    self._build_label_nodes_from_class_nodes()
+                    raise ValueError("label_nodes is None")
                 m[:, self.label_nodes] = 0
                 for i, label in enumerate(labels_batch):
                     class_nodes = self.label_class_nodes[int(label)]
                     m[i, class_nodes] = 1
             else:
-                labels = torch.zeros((bs, self.label_node_num), device=device)
-                for i, label in enumerate(labels_batch):
-                    # repeat one-hot across label sets: e.g. 0,10,20,30,40 are all "digit 0"
-                    labels[i][int(label)::self.label_class_num] = 1
-                m[:, self.input_node_num:self.input_node_num + self.label_node_num] = labels
+                raise ValueError("label_class_nodes is None")
 
         # to bipolar {-1,+1}
         m = torch.where(m == 0, -1.0, 1.0)
@@ -371,3 +367,63 @@ class lsing_model(torch.nn.Module):
         else:
             self.label_class_nodes = None
             self.label_nodes = None
+
+    @torch.no_grad()
+    def nmfa_warm_start(
+        self,
+        m: torch.Tensor,
+        steps: int = 50,
+        T_start: float = 5.0,
+        T_end: float = 0.5,
+        sigma: float = 0.2,
+        alpha: float = 0.9,
+        clamp_nodes:  Optional[torch.Tensor] = None,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """
+        NMFA 预热（作为 sampler warm-start），输出 bipolar {-1,+1} 的 m。
+        - m: [B, N] bipolar
+        - clamp_nodes: 若给定，表示这些节点在 NMFA 期间固定不变（可选）
+        """
+        # 连续自旋版本（float），NMFA 会在 [-1,1] 内演化
+        s = m.to(dtype=torch.float32).clone()
+
+        # 稀疏乘加：每次 NMFA step 需要一次 J*s + H
+        # 注意：J 在训练过程中会更新；这里每次调用都转一次 sparse（pattern 固定但值在变）
+        J_sparse = self.J.to_sparse_coo()
+
+        # 温度 schedule：几何退火更平滑
+        if steps <= 1:
+            Ts = [T_end]
+        else:
+            ratio = (T_end / T_start) ** (1.0 / (steps - 1))
+            Ts = [T_start * (ratio ** t) for t in range(steps)]
+
+        for T in Ts:
+            # Phi = J*s + H
+            Phi = torch.sparse.mm(J_sparse, s.T).T + self.H  # [B, N]
+
+            # RMS 归一化（文章里的做法之一）
+            rms = Phi.pow(2).mean(dim=1, keepdim=True).sqrt() + eps
+            Phi = Phi / rms
+
+            # 加噪声
+            if sigma > 0:
+                Phi = Phi + torch.randn_like(Phi) * sigma
+
+            # 均值场更新 + feedback mixing
+            s_new = torch.tanh(Phi / max(T, eps))
+            s = alpha * s + (1.0 - alpha) * s_new
+
+            # 若指定 clamp，则固定这些节点（可选）
+            if clamp_nodes is not None:
+                s[:, clamp_nodes] = m[:, clamp_nodes].to(s.dtype)
+
+        # 连续 -> 二值 bipolar
+        out = torch.sign(s)
+        out = torch.where(out == 0, torch.ones_like(out), out)
+
+        if clamp_nodes is not None:
+            out[:, clamp_nodes] = m[:, clamp_nodes]
+
+        return out.to(m.dtype)
