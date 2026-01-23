@@ -377,22 +377,13 @@ class lsing_model(torch.nn.Module):
         T_end: float = 0.5,
         sigma: float = 0.2,
         alpha: float = 0.9,
-        clamp_nodes:  Optional[torch.Tensor] = None,
+        clamp_nodes: Optional[torch.Tensor] = None,
         eps: float = 1e-8,
+        return_continuous: bool = False,   # NEW
     ) -> torch.Tensor:
-        """
-        NMFA 预热（作为 sampler warm-start），输出 bipolar {-1,+1} 的 m。
-        - m: [B, N] bipolar
-        - clamp_nodes: 若给定，表示这些节点在 NMFA 期间固定不变（可选）
-        """
-        # 连续自旋版本（float），NMFA 会在 [-1,1] 内演化
         s = m.to(dtype=torch.float32).clone()
-
-        # 稀疏乘加：每次 NMFA step 需要一次 J*s + H
-        # 注意：J 在训练过程中会更新；这里每次调用都转一次 sparse（pattern 固定但值在变）
         J_sparse = self.J.to_sparse_coo()
 
-        # 温度 schedule：几何退火更平滑
         if steps <= 1:
             Ts = [T_end]
         else:
@@ -400,30 +391,59 @@ class lsing_model(torch.nn.Module):
             Ts = [T_start * (ratio ** t) for t in range(steps)]
 
         for T in Ts:
-            # Phi = J*s + H
             Phi = torch.sparse.mm(J_sparse, s.T).T + self.H  # [B, N]
 
-            # RMS 归一化（文章里的做法之一）
             rms = Phi.pow(2).mean(dim=1, keepdim=True).sqrt() + eps
             Phi = Phi / rms
 
-            # 加噪声
             if sigma > 0:
                 Phi = Phi + torch.randn_like(Phi) * sigma
 
-            # 均值场更新 + feedback mixing
             s_new = torch.tanh(Phi / max(T, eps))
             s = alpha * s + (1.0 - alpha) * s_new
 
-            # 若指定 clamp，则固定这些节点（可选）
             if clamp_nodes is not None:
                 s[:, clamp_nodes] = m[:, clamp_nodes].to(s.dtype)
 
-        # 连续 -> 二值 bipolar
+        if return_continuous:
+            return s  # [-1,1] float
+
+        # 原本的 sign 路径保留（你想继续 warm-start + Gibbs 时还能用）
         out = torch.sign(s)
         out = torch.where(out == 0, torch.ones_like(out), out)
-
         if clamp_nodes is not None:
             out[:, clamp_nodes] = m[:, clamp_nodes]
-
         return out.to(m.dtype)
+
+    @torch.no_grad()
+    def sample_bipolar_from_soft(
+            self,
+            s: torch.Tensor,
+            clamp_nodes: Optional[torch.Tensor] = None,
+            clamp_values: Optional[torch.Tensor] = None,
+            n_draws: int = 1,
+    ) -> torch.Tensor:
+        """
+		s: [B, N] in [-1,1]
+		线性概率：P(+1) = (s+1)/2
+		返回：
+		  - n_draws==1: [B, N] bipolar
+		  - n_draws>1 : [B, n_draws, N] bipolar
+		"""
+        p = (s + 1.0) * 0.5
+        p = torch.clamp(p, 0.0, 1.0)
+
+        if n_draws == 1:
+            u = torch.rand_like(p)
+            out = torch.where(u < p, torch.ones_like(p), -torch.ones_like(p))
+            if clamp_nodes is not None and clamp_values is not None:
+                out[:, clamp_nodes] = clamp_values[:, clamp_nodes]
+            return out
+        else:
+            B, N = p.shape
+            u = torch.rand((B, n_draws, N), device=p.device, dtype=p.dtype)
+            p3 = p[:, None, :].expand(B, n_draws, N)
+            out = torch.where(u < p3, torch.ones_like(u), -torch.ones_like(u))
+            if clamp_nodes is not None and clamp_values is not None:
+                out[:, :, clamp_nodes] = clamp_values[:, None, clamp_nodes]
+            return out
