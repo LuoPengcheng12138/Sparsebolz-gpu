@@ -447,3 +447,129 @@ class lsing_model(torch.nn.Module):
             if clamp_nodes is not None and clamp_values is not None:
                 out[:, :, clamp_nodes] = clamp_values[:, None, clamp_nodes]
             return out
+
+
+    @torch.no_grad()
+    def mf_relax(
+        self,
+        mu: torch.Tensor,
+        steps: int = 50,
+        beta: float = 1.0,
+        clamp_nodes: torch.Tensor | None = None,
+        clamp_values: torch.Tensor | None = None,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """
+        Mean-Field fixed-point iterations:
+          mu <- tanh(beta * (J mu + H))
+        支持 clamp（用于正相位：固定可见/label bits）
+        mu: [B, N] in [-1,1]
+        """
+        beta = float(beta)
+
+        # 用稀疏乘法更省（你原来 construct 里也这么做）
+        J_sparse = self.J.to_sparse_coo()
+
+        if clamp_nodes is not None:
+            if clamp_values is None:
+                raise ValueError("clamp_values must be provided when clamp_nodes is not None")
+            # 确保 clamp 的值固定住
+            mu[:, clamp_nodes] = clamp_values[:, clamp_nodes].to(mu.dtype)
+
+        for _ in range(int(steps)):
+            field = torch.sparse.mm(J_sparse, mu.T).T + self.H  # [B,N]
+            mu = torch.tanh(field * beta)
+
+            if clamp_nodes is not None:
+                mu[:, clamp_nodes] = clamp_values[:, clamp_nodes].to(mu.dtype)
+
+        return mu
+
+    @torch.no_grad()
+    def updateParams_from_mu(
+        self,
+        mu_pos: torch.Tensor,
+        mu_neg: torch.Tensor,
+        batch_size: int,
+        lr: float = 3e-3,
+        momentum: float = 0.6,
+    ) -> None:
+        """
+        用 MF 的均值 mu 直接做相关项：
+          <m_i m_j> ≈ mu_i mu_j
+          <m_i>     ≈ mu_i
+        """
+        # correlations: [N,N]
+        dJ = (mu_pos.T @ mu_pos - mu_neg.T @ mu_neg) / float(batch_size)
+        dH = (mu_pos - mu_neg).mean(dim=0)
+
+        # 复用你原来的动量缓存（如果你之前是标量0，这里确保是 tensor）
+        if not torch.is_tensor(self.deta_J_all):
+            self.deta_J_all = torch.zeros_like(self.J)
+        if not torch.is_tensor(self.deta_H_all):
+            self.deta_H_all = torch.zeros_like(self.H)
+
+        self.deta_J_all = momentum * self.deta_J_all + lr * dJ
+        self.deta_H_all = momentum * self.deta_H_all + lr * dH
+
+        self.J = self.J + self.deta_J_all * self.J_mask
+        self.H = self.H + self.deta_H_all
+
+    @torch.no_grad()
+    def mf_classify(
+            self,
+            images_batch: torch.Tensor,
+            steps: int = 50,
+            beta: float = 1.0,
+            init: str = "zeros",  # "zeros" | "random" | "persistent"
+            persistent_state: torch.Tensor | None = None,  # [B,N]
+    ):
+        """
+        MF inference for classification:
+          - clamp input_nodes to given images
+          - free label + hidden nodes
+          - run mean-field
+          - read out label by summing mu on class nodes
+        Returns: (preds, mu, new_persistent_state)
+        """
+        bs = images_batch.shape[0]
+        device = images_batch.device
+
+        # 先构造一个 clamp 的 bipolar m（仅用于提供 clamp_values）
+        m_clamp = self.create_m(images_batch=images_batch)  # labels/random, hidden/random, but we only use input bits
+        clamp_nodes = getattr(self, "input_nodes", None)
+        if clamp_nodes is None:
+            raise ValueError("input_nodes is None; cannot clamp inputs for MF classify")
+
+        # 初始化 mu
+        if init == "persistent" and persistent_state is not None and persistent_state.shape[0] == bs:
+            mu = persistent_state.clone()
+        elif init == "random":
+            mu = torch.empty((bs, self.all_node_num), device=device).uniform_(-1.0, 1.0)
+        else:  # zeros
+            mu = torch.zeros((bs, self.all_node_num), device=device, dtype=torch.float32)
+
+        # clamp 输入位
+        mu[:, clamp_nodes] = m_clamp[:, clamp_nodes].to(mu.dtype)
+
+        # MF 迭代：只固定 input_nodes，其余（label+hidden）全更新
+        mu = self.mf_relax(
+            mu,
+            steps=steps,
+            beta=beta,
+            clamp_nodes=clamp_nodes,
+            clamp_values=m_clamp,  # 只会用到 input_nodes 对应列
+        )
+
+        # 读出类别：对每个 class 的 label nodes 求和（与你的 predict_labels 一致）
+        if not getattr(self, "label_class_nodes", None):
+            raise ValueError("label_class_nodes is missing; cannot read out class labels")
+
+        class_keys = sorted(self.label_class_nodes.keys())
+        class_nodes = [self.label_class_nodes[k] for k in class_keys]
+        scores = torch.stack([mu[:, idxs].sum(dim=1) for idxs in class_nodes], dim=1)
+        preds = scores.argmax(dim=1)
+
+        # persistent：推理时也可以持久化 label+hidden 的均值，加速下一批
+        new_persistent = mu.detach()
+        return preds, mu, new_persistent
