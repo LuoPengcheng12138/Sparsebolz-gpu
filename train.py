@@ -35,179 +35,127 @@ import torch
 from tqdm import tqdm
 from lsing import lsing_model
 import numpy as np
+from line_profiler import profile
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# -------- NMFA hyperparams (建议按 phase 分开) --------
-NMFA_POS_STEPS   = 400
-NMFA_POS_T_START = 2.0
-NMFA_POS_T_END   = 1.0
-NMFA_POS_SIGMA   = 0.05
-NMFA_POS_ALPHA   = 0.85
+input_node_num = 28*28
+label_class_num = 10
+label_node_num = 50
 
-NMFA_NEG_STEPS   = 600
-NMFA_NEG_T_START = 5.0
-NMFA_NEG_T_END   = 0.8
-NMFA_NEG_SIGMA   = 0.15
-NMFA_NEG_ALPHA   = 0.85
+# ---- MF hyperparams ----
+MF_POS_STEPS = 80
+MF_NEG_STEPS = 80
+MF_INF_STEPS = 80
 
-NMFA_INF_STEPS   = 300
-NMFA_INF_T_START = 2.0
-NMFA_INF_T_END   = 1.0
-NMFA_INF_SIGMA   = 0.05
-NMFA_INF_ALPHA   = 0.85
+MF_BETA = 1.0
+MF_DAMP = 0.5  # 0=纯固定点; 建议 0.3~0.7 更稳
 
-# 每个 phase 的采样次数：越大相关估计越稳，但更慢
-N_DRAWS_POS = 8
-N_DRAWS_NEG = 8
-
-def predict_labels_soft(s, model):
-    """直接用连续 s 做分类读出（更稳，不需要再采样）。"""
+def predict_labels_from_mu(mu, model):
+    """从连续 mu 直接读出 label（不需要采样）。"""
     if getattr(model, "label_class_nodes", None):
         class_keys = sorted(model.label_class_nodes.keys())
         class_nodes = [model.label_class_nodes[k] for k in class_keys]
-        scores = torch.stack([s[:, idxs].sum(dim=1) for idxs in class_nodes], dim=1)
+        scores = torch.stack([mu[:, idxs].sum(dim=1) for idxs in class_nodes], dim=1)
         return scores.argmax(dim=1)
 
-    # 若没有 label_class_nodes，就退回到你的老布局（一般你有）
-    input_node_num = model.input_node_num
-    label_node_num = model.label_node_num
-    label_class_num = model.label_class_num
-    logits = s[:, input_node_num:input_node_num+label_node_num].reshape(
+    logits = mu[:, input_node_num:input_node_num+label_node_num].reshape(
         -1, label_node_num//label_class_num, label_class_num
     )
     return logits.sum(dim=-2).argmax(dim=-1)
 
-def expand_draws_to_samples(m_draws):
-    """
-    m_draws: [B, n_draws, N] -> [B*n_draws, N]
-    """
-    B, D, N = m_draws.shape
-    return m_draws.reshape(B * D, N)
-
-@torch.no_grad()
+@profile
 def main():
     model = lsing_model(label_class_num=label_class_num, label_node_num=label_node_num).to(device)
 
-    # ---- persistent negative continuous state (PCD-style) ----
-    persistent_s_neg = None  # [B,N] float in [-1,1]
+    visible_nodes = model._get_visible_nodes()
+    if visible_nodes is None:
+        visible_nodes = torch.arange(model.input_node_num + model.label_node_num, device=device)
+
+    # persistent MF state for negative phase (PCD-style but MF)
+    persistent_mu_neg = None
 
     test_acc = []
-    for epoch in range(5):
-        acc = torch.tensor([], device=device)
-        bar = tqdm(train_dataset_loader)
+    with torch.no_grad():
+        for epoch in range(5):
+            acc = torch.tensor([], device=device)
+            bar = tqdm(train_dataset_loader)
 
-        for images_batch, labels_batch in bar:
-            bs = images_batch.shape[0]
+            for images_batch, labels_batch in bar:
+                bs = images_batch.shape[0]
 
-            # visible nodes (image + label)
-            visible_nodes = model._get_visible_nodes()
-            if visible_nodes is None:
-                raise ValueError("visible_nodes is None")
+                # ========= Positive phase (MF, clamp visible=image+label) =========
+                m_pos = model.create_m(images_batch, labels_batch)  # bipolar {-1,+1}
+                mu0_pos = m_pos.to(torch.float32)                   # init
 
-            # =======================
-            # Positive phase (NMFA, clamped to image+label)
-            # =======================
-            m_pos0 = model.create_m(images_batch, labels_batch)  # bipolar, visible 已被 clamp :contentReference[oaicite:2]{index=2}
+                mu_pos = model.mf_relax(
+                    mu0_pos,
+                    steps=MF_POS_STEPS,
+                    beta=MF_BETA,
+                    alpha=MF_DAMP,
+                    clamp_nodes=visible_nodes,
+                    clamp_values=m_pos,   # clamp to true visible bits
+                )
 
-            s_pos = model.nmfa_warm_start(
-                m_pos0,
-                steps=NMFA_POS_STEPS,
-                T_start=NMFA_POS_T_START,
-                T_end=NMFA_POS_T_END,
-                sigma=NMFA_POS_SIGMA,
-                alpha=NMFA_POS_ALPHA,
-                clamp_nodes=visible_nodes,      # 正相：固定 image+label
-                return_continuous=True,
-            )
+                # ========= Negative phase (MF, free) =========
+                if persistent_mu_neg is None or persistent_mu_neg.shape[0] != bs:
+                    m0 = model.create_m(batch_size=bs)  # random bipolar
+                    persistent_mu_neg = m0.to(torch.float32)
 
-            m_pos_draws = model.sample_bipolar_from_soft(
-                s_pos,
-                clamp_nodes=visible_nodes,
-                clamp_values=m_pos0,
-                n_draws=N_DRAWS_POS,
-            )  # [B, D, N]
-            m_data = expand_draws_to_samples(m_pos_draws)        # [B*D, N]
+                mu_neg = model.mf_relax(
+                    persistent_mu_neg,
+                    steps=MF_NEG_STEPS,
+                    beta=MF_BETA,
+                    alpha=MF_DAMP,
+                    clamp_nodes=None,
+                    clamp_values=None,
+                )
+                persistent_mu_neg = mu_neg.detach()
 
-            # =======================
-            # Negative phase (NMFA, free run, persistent)
-            # =======================
-            if persistent_s_neg is None or persistent_s_neg.shape[0] != bs:
-                # 初始 persistent state：用随机 bipolar 更像原始链
-                m_neg0 = model.create_m(batch_size=bs)           # bipolar random
-                persistent_s_neg = m_neg0.to(torch.float32)
+                # ========= Parameter update (MF-ELBO update) =========
+                model.updateParamsMF(mu_pos, mu_neg, batch_size=bs)
 
-            s_neg = model.nmfa_warm_start(
-                persistent_s_neg,
-                steps=NMFA_NEG_STEPS,
-                T_start=NMFA_NEG_T_START,
-                T_end=NMFA_NEG_T_END,
-                sigma=NMFA_NEG_SIGMA,
-                alpha=NMFA_NEG_ALPHA,
-                clamp_nodes=None,              # 负相：不 clamp
-                return_continuous=True,
-            )
-            persistent_s_neg = s_neg.detach()
+                # ========= Inference / train accuracy (MF classify: clamp input only) =========
+                m_inf = model.create_m(images_batch)  # clamp input only, label随机
+                mu0_inf = m_inf.to(torch.float32)
 
-            m_neg_draws = model.sample_bipolar_from_soft(
-                s_neg,
-                clamp_nodes=None,
-                clamp_values=None,
-                n_draws=N_DRAWS_NEG,
-            )
-            m_model = expand_draws_to_samples(m_neg_draws)        # [B*D, N]
+                mu_inf = model.mf_relax(
+                    mu0_inf,
+                    steps=MF_INF_STEPS,
+                    beta=MF_BETA,
+                    alpha=MF_DAMP,
+                    clamp_nodes=model.input_nodes,  # 只 clamp 输入像素
+                    clamp_values=m_inf,
+                )
+                preds = predict_labels_from_mu(mu_inf, model)
 
-            # =======================
-            # Parameter update (保持你原 updateParams 不改)
-            # =======================
-            model.updateParams(m_data, m_model, batch_size=m_data.shape[0])
+                logits = torch.where(preds == labels_batch, 1.0, 0.0)
+                acc = torch.cat([acc, logits])
+                bar.set_postfix({"acc": acc.mean().item()})
 
-            # =======================
-            # Train-time inference (NMFA classify: clamp input only)
-            # =======================
-            m_inf0 = model.create_m(images_batch)  # 只 clamp input，label 随机 :contentReference[oaicite:3]{index=3}
-            input_nodes = model.input_nodes
-            s_inf = model.nmfa_warm_start(
-                m_inf0,
-                steps=NMFA_INF_STEPS,
-                T_start=NMFA_INF_T_START,
-                T_end=NMFA_INF_T_END,
-                sigma=NMFA_INF_SIGMA,
-                alpha=NMFA_INF_ALPHA,
-                clamp_nodes=input_nodes,        # 推断：只固定 image bits
-                return_continuous=True,
-            )
-            preds = predict_labels_soft(s_inf, model)
+            # ========= Test inference (MF classify) =========
+            acc = torch.tensor([], device=device)
+            for images_batch, labels_batch in test_dataset_loader:
+                m_inf = model.create_m(images_batch)
+                mu0_inf = m_inf.to(torch.float32)
 
-            logits = torch.where(preds == labels_batch, 1.0, 0.0)
-            acc = torch.cat([acc, logits])
-            bar.set_postfix({"acc": acc.mean().item()})
+                mu_inf = model.mf_relax(
+                    mu0_inf,
+                    steps=MF_INF_STEPS,
+                    beta=MF_BETA,
+                    alpha=MF_DAMP,
+                    clamp_nodes=model.input_nodes,
+                    clamp_values=m_inf,
+                )
+                preds = predict_labels_from_mu(mu_inf, model)
 
-        # =======================
-        # Test inference (NMFA classify)
-        # =======================
-        acc = torch.tensor([], device=device)
-        for images_batch, labels_batch in test_dataset_loader:
-            m_inf0 = model.create_m(images_batch)
-            input_nodes = model.input_nodes
-            s_inf = model.nmfa_warm_start(
-                m_inf0,
-                steps=NMFA_INF_STEPS,
-                T_start=NMFA_INF_T_START,
-                T_end=NMFA_INF_T_END,
-                sigma=NMFA_INF_SIGMA,
-                alpha=NMFA_INF_ALPHA,
-                clamp_nodes=input_nodes,
-                return_continuous=True,
-            )
-            preds = predict_labels_soft(s_inf, model)
-            logits = torch.where(preds == labels_batch, 1.0, 0.0)
-            acc = torch.cat([acc, logits])
+                logits = torch.where(preds == labels_batch, 1.0, 0.0)
+                acc = torch.cat([acc, logits])
 
-        print(f"epoch {epoch} test result acc:{acc.mean().item()}")
-        test_acc.append(acc.mean().item())
-        torch.save(model, "model.pth")
-        np.savetxt("test_acc.txt", test_acc)
+            print(f"epoch {epoch} test result acc:{acc.mean().item()}")
+            test_acc.append(acc.mean().item())
+            torch.save(model, "model.pth")
+            np.savetxt("test_acc.txt", test_acc)
 
 if __name__ == "__main__":
     main()

@@ -573,3 +573,65 @@ class lsing_model(torch.nn.Module):
         # persistent：推理时也可以持久化 label+hidden 的均值，加速下一批
         new_persistent = mu.detach()
         return preds, mu, new_persistent
+
+    @torch.no_grad()
+    def mf_relax(
+        self,
+        mu: torch.Tensor,
+        steps: int = 50,
+        beta: float = 1.0,
+        alpha: float = 0.0,  # damping: 0 表示纯固定点；>0 表示阻尼
+        clamp_nodes: Optional[torch.Tensor] = None,
+        clamp_values: Optional[torch.Tensor] = None,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """
+        Mean-field fixed-point iteration for Ising spins in {-1,+1}:
+            mu_i = tanh(beta*(sum_j J_ij mu_j + H_i))
+        Returns continuous mu in [-1,1].
+        """
+        s = mu.to(dtype=torch.float32).clone()
+        J_sparse = self.J.to_sparse_coo()
+        beta = float(beta)
+
+        # clamp once before iterations
+        if clamp_nodes is not None:
+            if clamp_values is None:
+                raise ValueError("clamp_values must be provided when clamp_nodes is not None")
+            s[:, clamp_nodes] = clamp_values[:, clamp_nodes].to(s.dtype)
+
+        for _ in range(int(steps)):
+            Phi = torch.sparse.mm(J_sparse, s.T).T + self.H  # [B,N]
+            s_new = torch.tanh(Phi * beta)
+
+            if alpha > 0.0:
+                # damping: s <- alpha*s + (1-alpha)*s_new
+                s = alpha * s + (1.0 - alpha) * s_new
+            else:
+                s = s_new
+
+            if clamp_nodes is not None:
+                s[:, clamp_nodes] = clamp_values[:, clamp_nodes].to(s.dtype)
+
+        return s
+
+    def updateParamsMF(self, mu_pos, mu_neg, batch_size, lr=3e-3, momentum=0.6):
+        """
+        MF-ELBO M-step style update using MF expectations:
+            <m_i> ~ mu_i
+            <m_i m_j> ~ mu_i mu_j
+        This is an exact update for the MF variational objective you are optimizing
+        (given mu_pos/mu_neg are the E-step solutions you use).
+        """
+        # mu_*: [B,N] in [-1,1]
+        mu_pos = mu_pos.to(torch.float32)
+        mu_neg = mu_neg.to(torch.float32)
+
+        deta_J_new = (torch.mm(mu_pos.T, mu_pos) - torch.mm(mu_neg.T, mu_neg)) / batch_size
+        deta_H_new = (mu_pos - mu_neg).mean(dim=0)
+
+        self.deta_J_all = momentum * self.deta_J_all + deta_J_new * lr
+        self.deta_H_all = momentum * self.deta_H_all + deta_H_new * lr
+
+        self.J = torch.add(self.J, self.deta_J_all * self.J_mask)
+        self.H = torch.add(self.H, self.deta_H_all)
